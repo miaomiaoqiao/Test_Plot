@@ -1,0 +1,803 @@
+from .SMUFile import *
+from .SMUTools import *
+
+import functools
+import matplotlib.pyplot as plt
+import logging
+import numpy as np
+import os
+import math
+
+
+# 判断图片当前尺寸是否合理，即当前col row 是否超出了 col_max row_max , 以及所需的fig数目是否超出当前的base_size和dpi允许画数
+def figure_size_judge(col, row, base_size, dpi=100):
+    # 首先计算当前 base_size和dpi下的col_max和row_max
+    col_n_max = math.floor(2 ** 13 / (base_size * dpi * col))
+    col_max = math.floor(2 ** 13 / (base_size * dpi)) if col_n_max == 0 else col_n_max * col
+    row_max = math.floor(2 ** 13 / (base_size * dpi)) - 1
+
+    col_in_fig = col
+    row_in_fig = row - 1
+
+    # 当前的col, row 超过一张图片的允许范围，必须分n张图
+    if col_in_fig * row_in_fig > col_max * row_max:
+        col_suggest = []
+        row_suggest = []
+        n_suggest = math.ceil(col_in_fig * row_in_fig / (col_max * row_max))
+        for i in range(n_suggest):
+            if i != n_suggest - 1:
+                col_suggest.append(col_max)
+                row_suggest.append(row_max + 1)
+            else:
+                col_suggest.append(col_max)
+                row_suggest.append(
+                    math.ceil((col_in_fig * row_in_fig - (n_suggest - 1) * col_max * row_max) / col_suggest[-1]) + 1)
+    elif row_in_fig > row_max:
+        row_suggest = [row_max + 1]
+        col_suggest = [col_max]
+        for i in range(1, col_n_max + 1):
+            if i * col * row_max >= col_in_fig * row_in_fig:
+                col_suggest = [i * col]
+                break
+        n_suggest = 1  # 建议的fig个数
+    elif col_in_fig > col_max:
+        col_suggest = [col_max]
+        row_suggest = [math.ceil(col_in_fig * row_in_fig / col_suggest[-1]) + 1]
+        n_suggest = 1  # 建议的fig个数
+    else:
+        col_suggest = [col]
+        row_suggest = [row]
+        n_suggest = 1  # 建议的fig个数
+
+    return n_suggest, col_suggest, row_suggest,
+
+
+class plot_core(object):
+    subplot = 'subplot'
+    only_subplot = 'only_subplot'
+    sum_fig = "sumplot"
+    plt_show = "plt_show"
+    subplot_cols = "subplot_cols"
+    figsize_base = "figsize_base"
+    ylim_list = "ylim_list"
+    xlim_list = "xlim_list"
+    x_label = "x_label"
+    y_label = "y_label"
+    sub_title_list = "sub_title_list"
+    plot_data = "plot_data"
+    file_name = "file_name"
+    title = "title"
+    curr_sweep = "curr_sweep"
+    bin_num = 'bin_num'
+    bin_width = 'bin_width'
+    bins = 'bins'
+
+    data_iv_df = "data_iv_df"
+    data_y_list = "data_y_list"
+    data_x_list = "data_x_list"
+    data_hist_list = "data_hist_list"
+    data_2d_arrays = "data_2d_arrays"
+
+    def __init__(self, plot_type="iv", **kwargs):
+        """ ----------------------------此处增新的绘图类型----------------------------"""
+        "                         每一个新类型需要定义para_dict_types                   "
+        self.fig_pack = None
+        self.subplot_fig_packs = []
+        self.ax_pack = None
+        self.sum_ax = None
+        self.sum_fig = None
+        self.plot_type = plot_type
+        self.kwargs = kwargs
+
+        para_dict_general = {'subplot': False, 'only_subplot': True, 'sumplot': False, 'plt_show': False,
+                             'subplot_cols': 6, 'figsize_base': 4,
+                             'ylim_list': None, 'xlim_list': None, 'x_label': "", 'y_label': "",
+                             'file_name': None, 'title': None,
+                             'plot_data': [], 'sub_title_list': None}
+        para_dict_types = {"iv": {"data_iv_df": None, "curr_sweep": False},
+                           "pl": {"data_y_list": [], "data_x_list": []},
+                           "hist": {"data_hist_list": [],
+                                    'bin_num': 10, 'bin_width': None, 'bins': None,
+                                    'x_label': "res", 'y_label': "count"},
+                           "imshow": {"data_2d_arrays": None},
+                           "contour": {"data_2d_arrays": None}, }
+
+        def update_dict(default_dict: dict, request_dict: dict) -> dict:
+            keys_to_keep = {key: request_dict[key] for key in request_dict.keys() if key in default_dict}
+            default_dict.update(keys_to_keep)
+            return default_dict.copy()
+
+        self.plot_paras = update_dict(default_dict={**para_dict_general, **para_dict_types[self.plot_type]},
+                                      request_dict=kwargs)
+
+        self.File = File_handle_Global
+
+    def base_data_check(self):
+        """ ----------------------------此处增新的绘图类型----------------------------"""
+        "          每一个新类型需要定义data_default, __x_data_check, 更新check_func       "
+        data_default = {
+            "iv": pd.DataFrame({"Voltage": [0], "Current": [0]}),
+            "pl": {"1D": [1], "2D": [[1]]},
+            "hist": [1] * 10,
+            "imshow": [[1, 1], [1, 1]],
+            "contour": [[[0, 0, 0, 1, 1, 1, 2, 2, 2]], [[0, 1, 2, 0, 1, 2, 0, 1, 2]], [[1, 1, 1, 1, 1, 1, 1, 1, 1]]]
+        }
+
+        # 数据保存提示
+        #  self.plot_paras[PlotCore.plot_data] = [[x中所有的数据: x1,x2...],
+        #                                         [y中所有的数据: y1,y2...]
+        #                                        ...]
+        def __iv_data_check():
+            if not isinstance(self.plot_paras[plot_core.data_iv_df], pd.DataFrame):
+                if is_2d_list(self.plot_paras["data_iv_df"]):
+                    self.File.print("iv data check: data_iv_df is a list")
+                    try:
+                        self.plot_paras["data_iv_df"] = pd.DataFrame(
+                            self.plot_paras["data_iv_df"],
+                            columns=["Voltage", "Current"] * (len(self.plot_paras["data_iv_df"]) // 2))
+                    except (TypeError, IndexError):
+                        self.plot_paras["data_iv_df"] = data_default["iv"]
+                        self.File.print("iv data check: data_iv_df is not a valid list")
+                else:
+                    self.plot_paras["data_iv_df"] = data_default["iv"]
+            if np.shape(self.plot_paras[plot_core.data_iv_df]["Voltage"].values) != np.shape(
+                    self.plot_paras[plot_core.data_iv_df]["Current"].values):
+                self.File.print("iv data check: A Dimension mismatch between volt and curr")
+                self.plot_paras[plot_core.data_iv_df] = data_default["iv"]
+            volt_total = self.plot_paras[plot_core.data_iv_df]["Voltage"].values
+            curr_total = self.plot_paras[plot_core.data_iv_df]["Current"].values
+            self.plot_paras[plot_core.plot_data] = \
+                [volt_total.reshape(volt_total.shape[0], -1).T, curr_total.reshape(curr_total.shape[0], -1).T]
+
+        def __pl_data_check():
+            def list_judge_for_dimension_empty_legal(list_to_judge):
+                empty = False
+                legal = True
+
+                subplot = self.plot_paras[plot_core.subplot]
+
+                if not list_to_judge:
+                    empty = True
+                    dimension = 1 if not subplot else 2
+                else:
+                    dimension_2d = False
+                    dimension_1d = False
+
+                    for li in range(len(list_to_judge)):
+                        if isinstance(list_to_judge[li], list):
+                            dimension_2d = True
+                        else:
+                            dimension_1d = True
+
+                    if dimension_1d and dimension_2d:
+                        legal = False
+                        dimension = 1 if not subplot else 2
+                    elif dimension_1d:
+                        dimension = 1
+                    else:
+                        dimension = 2
+                        if list_to_judge == [[]] * len(list_to_judge):
+                            empty = True
+
+                return dimension, empty, legal
+
+            data_x_list = self.plot_paras[plot_core.data_x_list]
+            data_y_list = self.plot_paras[plot_core.data_y_list]
+            [xd, xe, xl] = list_judge_for_dimension_empty_legal(data_x_list)
+            [yd, ye, yl] = list_judge_for_dimension_empty_legal(data_y_list)
+
+            # 1、data_y_list 是空的(1D, 2D) or data_y_list非法 根据yd生成对应的y
+            # 2、 y = data_y_list
+            if ye or not yl:
+                if yd == 1:
+                    y = data_default["pl"]["1D"]
+                else:
+                    y = data_default["pl"]["2D"]
+            else:
+                y = data_y_list
+            # 1、data_x_list is empty (1D, 2D) or data_x_list dimension is mismatched with y or data_x_list is illegal,
+            # generate new x based on yd
+            # 2、2.1: If data_x_list is 1D, check len(data_x_list) == len(y)
+            # 2、2.2: If data_x_list is 2D, check len(x) len(y) and handle it then check len(data_x_list[i]) == len(y[i])
+            if xe or yd != xd or not xl:
+                x = []
+                if yd == 1:
+                    x = np.arange(len(y)).tolist()
+                else:
+                    for yi in y:
+                        x.append(np.arange(len(yi)).tolist())
+            else:
+                x = data_x_list
+                if xd == 1:
+                    if len(x) != len(y):
+                        self.File.print("point line: x y dimension mismatch not x change to 1: len(y)")
+                        x = np.arange(len(y)).tolist()
+                else:
+                    if len(x) > len(y):
+                        x = x[0:len(y)]
+                    else:
+                        for i in range(len(y)):
+                            if i + 1 > len(x):
+                                self.File.print("x is less than : len(y)")
+                                x.append(np.arange(len(y[i])).tolist())
+                            else:
+                                if len(x[i]) != len(y[i]):
+                                    self.File.print(
+                                        "point line: x[%d] y[%d] dimension mismatch, x[%d] change to 1:len(y[%d] )"
+                                        % (i, i, i, i))
+                                    self.File.print("x[%d]:\n" % i, x[i], "y[%d]:\n" % i, y[i], )
+                                    x[i] = np.arange(len(y[i])).tolist()
+
+            self.plot_paras[plot_core.plot_data] = [x, y]
+
+        def __hist_data_check():
+            # None, 不是list, 是list但里面内容时空的
+            data_hist_list = self.plot_paras[plot_core.data_hist_list]
+            if data_hist_list is None or not isinstance(data_hist_list, list) or not data_hist_list:
+                self.File.print("data for hist has wrong format! now data_hist = [[1]*10]")
+                data_list = [data_default["hist"]]
+            else:
+                # 二维hist_list需要避免空的子list
+                if isinstance(data_hist_list[0], list):
+                    data_list = [data_default["hist"] if not data else data for data in data_hist_list]
+                # 一维hist_list
+                else:
+                    data_list = data_hist_list
+            self.plot_paras[plot_core.plot_data] = [data_list]
+
+        def __imshow_data_check():  # 4d的数组
+            data_2d_arrays = self.plot_paras[plot_core.data_2d_arrays]
+            arrays_to_save = []
+            if is_3d_list(data_2d_arrays):
+                for array_i in data_2d_arrays:
+                    is_2d, pad_2d_array = check_and_pad_2d_array(array_i)
+                    if is_2d:
+                        arrays_to_save.append(pad_2d_array)
+                    else:
+                        arrays_to_save = [data_default["imshow"]]
+                        break
+            elif is_2d_list(data_2d_arrays):
+                is_2d, pad_2d_array = check_and_pad_2d_array(data_2d_arrays)
+                if is_2d:
+                    arrays_to_save.append(pad_2d_array)
+                else:
+                    arrays_to_save = [data_default["imshow"]]
+            else:
+                arrays_to_save = [data_default["imshow"]]
+
+            self.plot_paras[plot_core.plot_data] = [arrays_to_save]
+
+        def __contour_data_check():
+            X_lists = []
+            Y_lists = []
+            Z_lists = []
+
+            data_2d_arrays = self.plot_paras[plot_core.data_2d_arrays]
+            if is_3d_list(data_2d_arrays):
+                for array_i in data_2d_arrays:
+                    is_2d, pad_2d_array = check_and_pad_2d_array(array_i)
+                    if is_2d:
+                        [xi, yi, zi] = list_2d_array_to_3d_coordinate(pad_2d_array)
+                        X_lists.append(xi)
+                        Y_lists.append(yi)
+                        Z_lists.append(zi)
+                    else:
+                        [X_lists, Y_lists, Z_lists] = data_default["contour"]
+                        break
+
+            elif is_2d_list(data_2d_arrays):
+                is_2d, pad_2d_array = check_and_pad_2d_array(data_2d_arrays)
+                if is_2d:
+                    [xi, yi, zi] = list_2d_array_to_3d_coordinate(pad_2d_array)
+                    X_lists.append(xi)
+                    Y_lists.append(yi)
+                    Z_lists.append(zi)
+                else:
+                    [X_lists, Y_lists, Z_lists] = data_default["contour"]
+            else:
+                [X_lists, Y_lists, Z_lists] = data_default["contour"]
+
+            self.plot_paras[plot_core.plot_data] = [X_lists, Y_lists, Z_lists]
+
+        check_funcs = {"iv": __iv_data_check, "pl": __pl_data_check, "hist": __hist_data_check,
+                       "imshow": __imshow_data_check, "contour": __contour_data_check}
+        check_funcs[self.plot_type]()
+
+    def base_sumplot(self):
+        self.sum_fig = plt.figure()
+        self.sum_ax = self.sum_fig.add_subplot(111)
+
+        def sumplot_decorator_normal(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kw):
+                func(*args, **kw)
+                try:
+                    plt.title(self.plot_paras[plot_core.title])
+                    plt.subplots_adjust(left=0.15, right=0.9, bottom=0.15, top=0.8)
+                    plt.tick_params(axis='x', labelsize=9, rotation=-20)
+                    plt.xlabel(self.plot_paras[plot_core.x_label])
+                    plt.ylabel(self.plot_paras[plot_core.y_label])
+                    if self.plot_paras[plot_core.ylim_list]:
+                        plt.axis(ymin=self.plot_paras[plot_core.ylim_list][0],
+                                 ymax=self.plot_paras[plot_core.ylim_list][1])
+                    if self.plot_paras[plot_core.xlim_list]:
+                        plt.axis(xmin=self.plot_paras[plot_core.xlim_list][0],
+                                 xmax=self.plot_paras[plot_core.xlim_list][1])
+
+                    plt.savefig(self.plot_paras[plot_core.file_name])
+                except BaseException as e:
+                    self.File.print(self.plot_type + " plot fail to save file: ->")
+                    self.File.print(e)
+                    logging.exception(e)
+                if self.plot_paras[plot_core.plt_show]:
+                    plt.show()
+                plt.clf()
+
+            plt.close("all")
+
+            return wrapper
+
+        """ ----------------------------此处增新的绘图类型----------------------------"""
+        "            每一个新类型需要定义__x_sumplot_core, 并登记于sumplot_func           "
+
+        @sumplot_decorator_normal
+        def __iv_sumplot_core():
+            for volt, curr in zip(self.plot_paras[plot_core.plot_data][0], self.plot_paras[plot_core.plot_data][1]):
+                try:
+                    if self.plot_paras[plot_core.curr_sweep]:
+                        x, y = curr, volt
+                        self.plot_paras[plot_core.x_label], self.plot_paras[plot_core.y_label] = "curr", "volt"
+                    else:
+                        x, y = volt, curr
+                        self.plot_paras[plot_core.x_label], self.plot_paras[plot_core.y_label] = "volt", "curr"
+                    plt.plot(x, y)
+
+                except BaseException as e:
+                    self.File.print(e)
+                    logging.exception(e)
+                    self.File.print(self.plot_paras[plot_core.file_name])
+                    self.File.print("volt:", volt, "\n", "curr:", curr)
+
+        @sumplot_decorator_normal
+        def __pl_sumplot_core():
+            for x, y in zip(self.plot_paras[plot_core.plot_data][0], self.plot_paras[plot_core.plot_data][1]):
+                try:
+                    plt.plot(x, y, marker='o', markersize=2, color='red', linewidth=0.5, linestyle='-')
+                except BaseException as e:
+                    self.File.print(e)
+                    logging.exception(e)
+                    self.File.print(self.plot_paras[plot_core.file_name])
+                    self.File.print("x:", x, "\n", "y:", y)
+
+        @sumplot_decorator_normal
+        def __hist_sumplot_core():
+            data_hist = np.array(self.plot_paras[plot_core.plot_data]).flatten()
+            bins = self.plot_paras[plot_core.bins]
+            bin_num = self.plot_paras[plot_core.bin_num]
+            bin_width = self.plot_paras[plot_core.bin_width]
+            if not bins:
+                if max(data_hist) - min(data_hist) <= 0:
+                    bins = [max(data_hist), 2 * max(data_hist)]
+                else:
+                    bin_width = (max(data_hist) - min(data_hist)) / bin_num if bin_width is None else bin_width
+                    bins = np.arange(min(data_hist) - 0.5 * bin_width, max(data_hist) + 0.6 * bin_width, bin_width)
+
+            try:
+                plt.hist(data_hist, bins=bins, facecolor="red", edgecolor="black", alpha=0.7)
+            except BaseException as e:
+                self.File.print(e)
+                logging.exception(e)
+                self.File.print(self.plot_paras[plot_core.file_name])
+                self.File.print("data_hist:", data_hist)
+
+        @sumplot_decorator_normal
+        def __imshow_sumplot_core():
+            try:
+                if len(self.plot_paras[plot_core.plot_data][0]) > 1:
+                    self.File.print("The im_show may not work well when used in conjunction with sumplot")
+                arrays_2d_0 = self.plot_paras[plot_core.plot_data][0][0]
+                plt.imshow(arrays_2d_0, cmap='YlGnBu')
+                plt.colorbar()
+            except BaseException as e:
+                self.File.print(e)
+                logging.exception(e)
+                self.File.print(self.plot_paras[plot_core.file_name])
+                self.File.print("imshow:", self.plot_paras[plot_core.plot_data][0][0])
+
+        @sumplot_decorator_normal
+        def __contour_sumplot_core():
+            try:
+                if len(self.plot_paras[plot_core.plot_data][0]) > 1:
+                    self.File.print("The contour may not work well when used in conjunction with sumplot")
+                plt.contour(self.plot_paras[plot_core.plot_data][0][0],
+                            self.plot_paras[plot_core.plot_data][0][1],
+                            self.plot_paras[plot_core.plot_data][0][2])
+            except BaseException as e:
+                self.File.print(e)
+                logging.exception(e)
+                self.File.print(self.plot_paras[plot_core.file_name])
+                self.File.print("contour:", self.plot_paras[plot_core.plot_data][0])
+
+        sumplot_funcs = {"iv": __iv_sumplot_core, "pl": __pl_sumplot_core, "hist": __hist_sumplot_core,
+                         "imshow": __imshow_sumplot_core, "contour": __contour_sumplot_core}
+        sumplot_funcs[self.plot_type]()
+
+    def base_subplot(self):
+        def ax_decorator_normal(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kw):
+                func(*args, **kw)
+                self.ax_pack[-1].set_title(str(self.ax_pack[0]), color='green')
+                self.ax_pack[-1].tick_params(axis='x', rotation=-30)
+                self.ax_pack[-1].set_xlabel(self.plot_paras[plot_core.x_label])
+                self.ax_pack[-1].set_ylabel(self.plot_paras[plot_core.y_label])
+                if self.plot_paras[plot_core.ylim_list]:
+                    self.ax_pack[-1].axis(ymin=self.plot_paras[plot_core.ylim_list][0],
+                                          ymax=self.plot_paras[plot_core.ylim_list][1])
+                if self.plot_paras[plot_core.xlim_list]:
+                    self.ax_pack[-1].axis(xmin=self.plot_paras[plot_core.xlim_list][0],
+                                          xmax=self.plot_paras[plot_core.xlim_list][1])
+
+            return wrapper
+
+        """ ----------------------------此处增新的绘图类型----------------------------"""
+        "            每一个新类型需要定义__x_ax_core, ax_funcs           "
+
+        @ax_decorator_normal
+        def __iv_ax_core():
+            try:
+                if self.plot_paras[plot_core.curr_sweep]:
+                    x, y = self.ax_pack[1], self.ax_pack[2]
+                    self.plot_paras[plot_core.x_label], self.plot_paras[plot_core.y_label] = "curr", "volt"
+                else:
+                    x, y = self.ax_pack[2], self.ax_pack[1]
+                    self.plot_paras[plot_core.x_label], self.plot_paras[plot_core.y_label] = "volt", "curr"
+                self.ax_pack[-1].plot(x, y)
+
+            except BaseException as e:
+                self.File.print(e)
+                logging.exception(e)
+                self.File.print(self.fig_pack["fig_name"])
+                self.File.print("x:", self.ax_pack[1], "\n", "y:", self.ax_pack[2])
+
+        @ax_decorator_normal
+        def __pl_ax_core():
+            try:
+                x, y = self.ax_pack[1], self.ax_pack[2]
+                self.ax_pack[-1].plot(x, y, marker='o', markersize=2, color='red', linewidth=0.1, linestyle='-')
+            except BaseException as e:
+                self.File.print(e)
+                logging.exception(e)
+                self.File.print(self.fig_pack["fig_name"])
+                self.File.print("x:", self.ax_pack[1], "\n", "y:", self.ax_pack[2])
+
+        @ax_decorator_normal
+        def __hist_ax_core():
+            try:
+                bins = self.plot_paras[plot_core.bins]
+                bin_num = self.plot_paras[plot_core.bin_num]
+                bin_width = self.plot_paras[plot_core.bin_width]
+                sub_data = self.ax_pack[1]
+                if bins:
+                    sub_bins = bins
+                else:
+                    if len(sub_data) == 1:
+                        sub_bins = 1
+                    elif max(sub_data) == min(sub_data):
+                        sub_bins = 1
+                    elif len(sub_data) == 2:
+                        sub_bins = 2
+                    else:
+                        if bin_width:
+                            sub_bin_width = bin_width
+                            sub_bins = np.arange(min(sub_data) - 0.5 * sub_bin_width,
+                                                 max(sub_data) + 0.6 * sub_bin_width, sub_bin_width)
+                        else:
+                            sub_bin_width = (max(sub_data) - min(sub_data)) / (bin_num - 1)
+                            sub_bins = np.arange(min(sub_data) - 0.5 * sub_bin_width,
+                                                 max(sub_data) + 0.6 * sub_bin_width, sub_bin_width)
+                self.ax_pack[-1].hist(sub_data, bins=sub_bins, facecolor="red", edgecolor="black", alpha=0.7)
+            except BaseException as e:
+                self.File.print(e)
+                logging.exception(e)
+                self.File.print(self.plot_paras[plot_core.file_name])
+                self.File.print("data_hist:", self.ax_pack[1])
+
+        @ax_decorator_normal
+        def __imshow_ax_core():
+            try:
+                ax_imshow_handle = self.ax_pack[-1].imshow(self.ax_pack[1])
+                self.fig_pack["fig"].colorbar(ax_imshow_handle, ax=self.ax_pack[-1], shrink=0.5)
+            except BaseException as e:
+                self.File.print(e)
+                logging.exception(e)
+                self.File.print(self.plot_paras[plot_core.file_name])
+                self.File.print("imshow data:", self.ax_pack[1])
+
+        @ax_decorator_normal
+        def __contour_ax_core():
+            try:
+                self.ax_pack[-1].contour(
+                    self.ax_pack[1], self.ax_pack[2], self.ax_pack[3])
+            except BaseException as e:
+                self.File.print(e)
+                logging.exception(e)
+                self.File.print(self.plot_paras[plot_core.file_name])
+                self.File.print("contour:", self.ax_pack[1], self.ax_pack[2], self.ax_pack[3])
+
+        ax_funcs = {"iv": __iv_ax_core, "pl": __pl_ax_core, "hist": __hist_ax_core,
+                    "imshow": __imshow_ax_core, "contour": __contour_ax_core}
+
+        """ --------------------------以下为base_subplot的自动程序 除非出bug，强烈建议不修改----------------------------"""
+
+        def figure_decorator_normal(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kw):
+                func(*args, **kw)
+                try:
+                    fig_row, fig_base = self.fig_pack["size_infor"][0], self.fig_pack["size_infor"][2]
+                    plt.suptitle(self.fig_pack["fig_title"],
+                                 y=(fig_base * 0.9 + fig_base * (fig_row - 1)) / (fig_base * fig_row))
+                    plt.subplots_adjust(
+                        left=0.1, right=0.9,
+                        bottom=1 / ((fig_row - 1) * fig_base * 2), top=(fig_row - 1) / fig_row,
+                        wspace=0.5, hspace=0.4)
+                    plt.savefig(self.fig_pack["fig_name"])
+                except BaseException as e:
+                    self.File.print(self.fig_pack["fig_name"])
+                    self.File.print(self.plot_type + " plot fail to save file: ->")
+                    self.File.print(e)
+                    logging.exception(e)
+                if self.plot_paras[plot_core.plt_show]:
+                    self.fig_pack["fig"].show()
+
+            return wrapper
+
+        @figure_decorator_normal
+        def __figure_core():
+            for ax_pack_i in self.fig_pack["ax_pack"]:  # 提取一个ax所需的所有数据
+                self.ax_pack = ax_pack_i
+                ax_funcs[self.plot_type]()
+
+        def subplot_core():
+            for fig_pack in self.subplot_fig_packs:  # 提取一个figure所需的所有数据
+                self.fig_pack = fig_pack
+                plt.figure(self.fig_pack["fig"].number)
+                __figure_core()
+            plt.clf()
+            plt.close("all")
+
+        # title_generator code
+        if not self.plot_paras[plot_core.sub_title_list] or \
+                len(self.plot_paras[plot_core.sub_title_list]) != len(self.plot_paras[plot_core.plot_data][0]):
+            self.plot_paras[plot_core.sub_title_list] = list(range(len(self.plot_paras[plot_core.plot_data][0])))
+
+        # fig_pack packing code
+        [n_suggest, col_suggest, row_suggest] \
+            = figure_size_judge(col=self.plot_paras[plot_core.subplot_cols],
+                                row=math.ceil(len(self.plot_paras[plot_core.plot_data][0])
+                                              / self.plot_paras[plot_core.subplot_cols]) + 1,
+                                base_size=self.plot_paras[plot_core.figsize_base])
+        subplot_fig_name = \
+            self.File.file_exist_suffix(self.File.rename_add_suffix(self.plot_paras[plot_core.file_name], suffix="sub"))
+
+        ax_st = 0
+        for ni in range(n_suggest):
+            row, col, base = row_suggest[ni], col_suggest[ni], self.plot_paras[plot_core.figsize_base]
+            size_infor = [row, col, base]
+            fig, axs = plt.subplots(nrows=row - 1, ncols=col, figsize=(base * col, base * row))
+            axs = np.array(axs).flatten() if axs is not np.ndarray else axs.flatten()
+
+            if n_suggest == 1:
+                fig_title = self.plot_paras[plot_core.title]
+                fig_name = subplot_fig_name
+            else:
+                fig_title = self.plot_paras[plot_core.title] + "\nBig_Picture_%d" % ni
+                fig_name = self.File.rename_add_suffix(subplot_fig_name, suffix="Big%d" % ni)
+            ax_pack_T = [self.plot_paras[plot_core.sub_title_list][ax_st:ax_st + col * (row - 1)]]
+            for data in self.plot_paras[plot_core.plot_data]:
+                ax_pack_T.append(data[ax_st:ax_st + col * (row - 1)])
+            ax_pack_T.append(axs)
+            ax_st = ax_st + col * (row - 1)
+            self.subplot_fig_packs.append(
+                {"ax_pack": list(map(list, zip(*ax_pack_T))), "fig_name": fig_name, "fig_title": fig_title,
+                 "fig": fig, "size_infor": size_infor})
+        subplot_core()
+        #   主逻辑
+        #   根据当前的plot_data进行数据整理，产生[{fig_pack}，{fig_pack}，]subplot_fig_packs
+        #       subplot_fig_packs每一个元素是fig的pack，一个fig_pack包括
+        #       ax_pack 2D, axs 1D,
+        #       fig_name 1V,fig_title 1V, fig 1V, size_infor[r,c,base] 1D
+        #       ax_pack(2D)中包括[title, [x datas], [y datas], ...[axs]]
+
+        #  figure装饰器：优化当前的图片结构
+
+        #   主函数：
+        #       顶层：遍历subplot_fig_packs，并赋值于self.fig_pack
+        #       次层：遍历ax_pack(根据长度遍历)，第一维度是ax_title, 第二维度是以后是ax_data
+
+    def base_filename_check(self):
+        self.plot_paras[plot_core.file_name] = self.plot_paras[plot_core.file_name] + ".png" \
+            if ".png" not in self.plot_paras[plot_core.file_name] else self.plot_paras[plot_core.file_name]
+        self.plot_paras[plot_core.file_name] = \
+            self.File.rename_add_suffix(self.plot_paras[plot_core.file_name], suffix="_" + self.plot_type)
+        self.plot_paras[plot_core.file_name] = \
+            self.File.file_exist_suffix(self.plot_paras[plot_core.file_name])
+        self.File.create_new_path(self.plot_paras[plot_core.file_name])
+
+    def run(self):
+        # step1 检查: 数据，文件名
+        # step2 绘制sumplot
+        # step3 绘制subplot
+
+        # step 1
+        self.base_filename_check()
+        self.base_data_check()
+
+        # step 2
+        if not self.plot_paras["only_subplot"] or self.plot_paras["sumplot"]:
+            self.base_sumplot()
+
+        # step 3
+        if self.plot_paras["subplot"]:
+            self.base_subplot()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self.File.print("Error occurred in file:", self.plot_paras[plot_core.file_name])
+            self.File.print(f"Error occurred: {exc_val}")
+            logging.exception(exc_type)
+
+
+class SMUPlot(object):
+    def __init__(self):
+        self.plot_path_prefix = os.path.abspath(os.path.join(os.getcwd(), "..")) + "\\Save_Data\\Plot\\"
+        self.File = File_handle_Global
+        self.PlotCore = plot_core
+
+    def plot_iv_curve(self, **kwargs):
+        with self.PlotCore(plot_type="iv", **kwargs) as pc:
+            pc.run()
+
+    def plot_point_line(self, **kwargs):
+        with self.PlotCore(plot_type="pl", **kwargs) as pc:
+            pc.run()
+
+    def plot_hist(self, **kwargs):
+        with self.PlotCore(plot_type="hist", **kwargs) as pc:
+            pc.run()
+
+    def plot_imshow(self, **kwargs):
+        with self.PlotCore(plot_type="imshow", **kwargs) as pc:
+            pc.run()
+
+    def plot_contour(self, **kwargs):
+        with self.PlotCore(plot_type="contour", **kwargs) as pc:
+            pc.run()
+
+    def data_to_file_plot(self,
+                          data_infors=None,
+                          file_path="", plot_path="", path_suffix="",
+                          file_infix="", title_infix="",
+                          hist_general=None, pl_general=None, iv_general=None,
+                          imshow_general=None, contour_general=None):
+        empty_information = {"data": [], "plot_type": [], "sub_path": "",
+                             "file_prefix": "", "file_suffix": "",
+                             "title_prefix": "", "title_suffix": "",
+                             "hist_spec": {}, "pl_spec": {}, "iv_spec": {},
+                             "imshow_spec": {}, "contour_spec": {}}
+        if data_infors is None:
+            data_infors = [empty_information]
+        else:
+            for i, data in enumerate(data_infors):
+                data_infors[i] = {**empty_information, **data}
+
+        # 处理path_suffix
+        if len(path_suffix) > 0:
+            if file_path[-1] == "/" or file_path[-1] == "\\":
+                file_path = file_path[:-1] + path_suffix + "\\"
+            else:
+                file_path = file_path + path_suffix + "\\"
+            if plot_path[-1] == "/" or plot_path[-1] == "\\":
+                plot_path = plot_path[:-1] + path_suffix + "\\"
+            else:
+                plot_path = plot_path + path_suffix + "\\"
+
+        files_name_list = []
+        for var in data_infors:
+            var_file_path = file_path + var["sub_path"]
+            var_file_name = self.File.to_csv(pd_data_to_csv=pd.DataFrame(var["data"]),
+                                             file_name=
+                                             var_file_path + var["file_prefix"] + file_infix + var["file_suffix"])
+            files_name_list.append(var_file_name)
+
+        for file_name, var in zip(files_name_list, data_infors):
+            # st = time.time()
+            var_plot_path = plot_path + var["sub_path"]
+
+            if iv_general is not None:
+                iv_setting = {**iv_general, **var["iv_spec"]}
+                if "iv" in var["plot_type"]:
+                    self.plot_iv_curve(**iv_setting,
+                                       data_iv_df=var["data"],
+                                       file_name=var_plot_path + file_name,
+                                       title=var["title_prefix"] + title_infix + var["title_suffix"])
+            if pl_general is not None:
+                pl_setting = {**pl_general, **var["pl_spec"]}
+                if "pl" in var["plot_type"]:
+                    if isinstance(var["data"], dict):
+                        data_x_list = None if "x" not in var["data"] else var["data"]["x"]
+                        data_y_list = var["data"][0] if "y" not in var["data"] else var["data"]["y"]
+                    else:
+                        data_x_list = None
+                        data_y_list = var["data"]
+
+                    self.plot_point_line(**pl_setting,
+                                         data_x_list=data_x_list,
+                                         data_y_list=data_y_list,
+                                         file_name=var_plot_path + file_name,
+                                         title=var["title_prefix"] + title_infix + var["title_suffix"])
+            if hist_general is not None:
+                hist_setting = {**hist_general, **var["hist_spec"]}
+                if "hist" in var["plot_type"]:
+                    if isinstance(var["data"], dict):
+                        data_list = var["data"][0] if "y" not in var["data"] else var["data"]["y"]
+                    else:
+                        data_list = var["data"]
+                    self.plot_hist(**hist_setting,
+                                   data_hist_list=data_list,
+                                   file_name=var_plot_path + file_name,
+                                   title=var["title_prefix"] + title_infix + var["title_suffix"])
+            if imshow_general is not None:
+                imshow_setting = {**imshow_general, **var["imshow_spec"]}
+                if "imshow" in var["plot_type"]:
+                    self.plot_imshow(**imshow_setting,
+                                     data_2d_arrays=var["data"],
+                                     file_name=var_plot_path + file_name,
+                                     title=var["title_prefix"] + title_infix + var["title_suffix"])
+            if contour_general is not None:
+                contour_setting = {**contour_general, **var["contour_spec"]}
+                if "contour" in var["plot_type"]:
+                    self.plot_contour(**contour_setting,
+                                      data_2d_arrays=var["data"],
+                                      file_name=var_plot_path + file_name,
+                                      title=var["title_prefix"] + title_infix + var["title_suffix"])
+
+
+# plot = SMUPlot()
+# n = 10
+# array_2d = np.random.randn(100, 100).tolist()
+# arrays_2d = [array_2d] * 12
+# print(["test"]*12,)
+# plot.plot_imshow(
+#     plt_show=True, subplot=True, sumplot=True,
+#     data_2d_arrays=arrays_2d, sub_title_list=["test"]*12,
+#     file_name=os.getcwd() + "SMU_Plot\\NoName_imshow.png", title="NoName_imshow",
+#     )
+# plot.plot_imshow(
+#     plt_show=True, subplot=True, sumplot=False,
+#     data_2d_arrays=arrays_2d, sub_title_list=None,
+#     file_name=os.getcwd() + "SMU_Plot\\NoName_contour.png", title="NoName_contour")
+# IV_data_tb = pd.DataFrame([[1, 1] * n, [2, 2] * n, [3, 3] * n, [4, 4] * n])
+# IV_data_tb.columns = ["Voltage", "Current"] * n
+# plot.plot_iv_curve(
+#     plt_show=False, subplot=True, sumplot=True,
+#     data_iv_df=IV_data_tb, sub_title_list=None,
+#     curr_sweep=True, xlim_list=[1, 2],
+#     file_name=os.getcwd() + "SMU_Plot\\NoNameIV.png", title="NoName_iv")
+# plot.plot_point_line(
+#     plt_show=False, subplot=True, sumplot=True,
+#     data_y_list=[[1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 3, 4, 5, 6, 7, 8, 9]] * n, sub_title_list=None,
+#     ylim_list=[1, 7],
+#     file_name=os.getcwd() + "SMU_Plot\\NoName.png", title="NoName_pl",
+# )
+# plot.plot_hist(
+#     plt_show=False, subplot=True, sumplot=True,
+#     data_hist_list=[[1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 3, 4, 5, 6, 7, 8, 9]] * n, sub_title_list=None,
+#     xlim_list=[0, 10],
+#     bin_num=10, bin_width=1, bins=None,
+#     file_name=os.getcwd() + "SMU_Plot\\NoName.png", title="NoName_hist",
+# )
